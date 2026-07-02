@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "boxen": "^5.1.2",
+    "chalk": "^4.1.2",
+    "log-symbols": "^4.1.0",
+    "ora": "^5.4.1",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
