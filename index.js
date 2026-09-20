@@ -2,6 +2,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { Transform, pipeline } = require('stream');
+const Busboy = require('busboy');
 
 // ── Terminal niceties ──────────────────────────────────────────
 const chalk = require('chalk');
@@ -10,10 +12,147 @@ const ora = require('ora');
 const symbols = require('log-symbols');
 const qrcode = require('qrcode-terminal');
 
+// ── .env loader (no dependency) ────────────────────────────────
+// Reads .env next to this file if present. Real env vars always win.
+(function loadDotEnv() {
+  let text;
+  try {
+    text = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+  } catch {
+    return; // no .env — fine
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq === -1) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    // Strip surrounding quotes: SHARE_DIR="/srv/file share/files"
+    if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value[value.length - 1] === value[0]) {
+      value = value.slice(1, -1);
+    }
+    if (key && process.env[key] === undefined) process.env[key] = value;
+  }
+})();
+
 // ── Configuration ──────────────────────────────────────────────
 const PORT = process.env.PORT || 8420;
-const SERVE_ROOT = path.join(__dirname, 'file');
+// Shared data lives OUTSIDE the project, so `git pull` never touches user files.
+const SERVE_ROOT = process.env.SHARE_DIR || '/srv/file-share/files';
+const ROOT = path.resolve(SERVE_ROOT);
 const PAGE_TITLE = '文件共享';
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES) || 0; // 0 = 无限制
+
+// ── Shared folder must exist before we serve anything ──────────
+(function ensureRoot() {
+  try {
+    fs.mkdirSync(ROOT, { recursive: true });
+    // Fail at startup rather than on the first upload.
+    fs.accessSync(ROOT, fs.constants.R_OK | fs.constants.W_OK);
+  } catch (err) {
+    console.error('');
+    console.error(`  ${symbols.error}  ${chalk.red('共享目录不可用')} ${chalk.white(ROOT)}`);
+    console.error(`  ${chalk.gray(err.code + ': ' + err.message)}`);
+    console.error('');
+    console.error(chalk.yellow('  请通过环境变量指定一个有写权限的目录：'));
+    console.error(chalk.gray('    Linux  : ') + chalk.white('SHARE_DIR=/srv/file-share/files node index.js'));
+    console.error(chalk.gray('    Windows: ') + chalk.white('set SHARE_DIR=D:\\file-share\\files && node index.js'));
+    console.error(chalk.gray('    或复制 ') + chalk.white('.env.example') + chalk.gray(' 为 ') + chalk.white('.env') + chalk.gray(' 并修改 SHARE_DIR'));
+    console.error('');
+    console.error(chalk.gray('  注意：不要回退到项目目录存放共享文件，否则 git pull 会影响用户数据。'));
+    console.error('');
+    process.exit(1);
+  }
+})();
+
+// ── Traffic accounting (whole server, all clients) ─────────────
+// Counters are cumulative byte totals; speed is derived once per second.
+const traffic = {
+  uploadBytes: 0,
+  downloadBytes: 0,
+  activeUploads: 0,
+  activeDownloads: 0,
+};
+
+const speed = { upload: 0, download: 0 };
+let lastSample = { bytes: 0, bytesDown: 0, at: Date.now() };
+
+setInterval(() => {
+  const now = Date.now();
+  const seconds = (now - lastSample.at) / 1000;
+  if (seconds <= 0) return;
+  speed.upload = Math.max(0, Math.round((traffic.uploadBytes - lastSample.bytes) / seconds));
+  speed.download = Math.max(0, Math.round((traffic.downloadBytes - lastSample.bytesDown) / seconds));
+  lastSample = { bytes: traffic.uploadBytes, bytesDown: traffic.downloadBytes, at: now };
+}, 1000).unref();
+
+// Counts bytes that actually pass through, not bytes read off disk.
+function meterStream(counter, onBytes) {
+  return new Transform({
+    transform(chunk, _encoding, callback) {
+      traffic[counter] += chunk.length;
+      if (onBytes) onBytes(chunk.length);
+      callback(null, chunk);
+    },
+  });
+}
+
+// ── Path safety ────────────────────────────────────────────────
+// NOTE: a naive `resolved.startsWith(ROOT)` is wrong — it would also accept
+// "/srv/file-share/files-evil". Require an exact match or a real separator.
+function safeResolve(relative) {
+  const target = path.resolve(ROOT, relative || '');
+  if (target !== ROOT && !target.startsWith(ROOT + path.sep)) return null;
+  return target;
+}
+
+// Turn any user-supplied label into a single safe path segment.
+function safeName(raw) {
+  let name = String(raw == null ? '' : raw);
+  name = name.split(/[\\/]/).pop() || '';        // drop any directory part (both separators, any OS)
+  name = name.replace(/[\x00-\x1f\x7f]/g, '');   // control chars & NUL
+  name = name.trim();
+  if (name === '.' || name === '..') name = '';  // never a directory reference
+  if (!name) name = 'unnamed';
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i.test(name)) name = '_' + name; // Windows reserved
+  if (Buffer.byteLength(name) > 200) {           // keep the extension, trim the stem
+    const ext = path.extname(name).slice(0, 20);
+    name = Buffer.from(name).subarray(0, 200 - Buffer.byteLength(ext)).toString('utf8').replace(/\uFFFD$/, '') + ext;
+  }
+  return name;
+}
+
+// "test.zip" -> "test (1).zip" -> "test (2).zip"
+function withSuffix(name, n) {
+  const ext = path.extname(name);
+  return `${path.basename(name, ext)} (${n})${ext}`;
+}
+
+// Create a new file without ever overwriting. 'wx' is atomic, so two clients
+// uploading "test.zip" at the same moment can't both win.
+function createUniqueFile(dir, name) {
+  for (let attempt = 0; attempt <= 9999; attempt++) {
+    const candidate = attempt === 0 ? name : withSuffix(name, attempt);
+    try {
+      const fd = fs.openSync(path.join(dir, candidate), 'wx');
+      return { stream: fs.createWriteStream(null, { fd }), finalName: candidate };
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+    }
+  }
+  throw new Error('同名文件过多');
+}
+
+function sendJSON(res, status, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
 
 // ── MIME map ───────────────────────────────────────────────────
 const MIME = {
@@ -123,6 +262,64 @@ function encodePath(p) {
   return p.split('/').map(encodeURIComponent).join('/');
 }
 
+// ── Live throughput panel ──────────────────────────────────────
+// Values are the whole server's — every client's transfers added together,
+// not just the browser looking at this page.
+function renderTraffic() {
+  return `
+    <section class="traffic" aria-label="服务器实时速度">
+      <div class="traffic-grid">
+        <div class="traffic-cell">
+          <span class="traffic-label"><span class="arrow-up">▲</span> 上传速度</span>
+          <span class="traffic-value num" id="stat-upload">0 B/s</span>
+        </div>
+        <div class="traffic-cell">
+          <span class="traffic-label"><span class="arrow-down">▼</span> 下载速度</span>
+          <span class="traffic-value num" id="stat-download">0 B/s</span>
+        </div>
+        <div class="traffic-cell">
+          <span class="traffic-label">活动上传</span>
+          <span class="traffic-value num" id="stat-active-upload">0</span>
+        </div>
+        <div class="traffic-cell">
+          <span class="traffic-label">活动下载</span>
+          <span class="traffic-value num" id="stat-active-download">0</span>
+        </div>
+      </div>
+      <svg class="duplex" id="duplex" viewBox="0 0 300 40" preserveAspectRatio="none" aria-hidden="true">
+        <line class="duplex-axis" x1="0" y1="20" x2="300" y2="20" />
+        <polyline class="duplex-line duplex-up" id="duplex-up" points="" />
+        <polyline class="duplex-line duplex-down" id="duplex-down" points="" />
+      </svg>
+      <div class="duplex-caption">
+        <span>近 60 秒 · 所有用户合计</span>
+        <span><span class="arrow-up">▲</span> 上传&nbsp;&nbsp;<span class="arrow-down">▼</span> 下载</span>
+      </div>
+    </section>`;
+}
+
+// ── Upload panel (uploads land in the directory being viewed) ──
+function renderUpload(relPath) {
+  const here = '/' + (relPath ? relPath + '/' : '');
+  return `
+    <section class="upload-panel">
+      <div class="drop-zone" id="drop-zone">
+        <div class="drop-row">
+          <div class="drop-text">
+            <span class="drop-title">拖拽文件到这里上传</span>
+            <span class="drop-sub">保存到 <code>${escapeHTML(here)}</code></span>
+          </div>
+          <div class="drop-actions">
+            <button type="button" class="btn" id="pick-btn">选择文件</button>
+            <button type="button" class="btn btn-primary" id="upload-btn" disabled>上传</button>
+          </div>
+        </div>
+        <input type="file" id="file-input" multiple hidden>
+      </div>
+      <div class="upload-list" id="upload-list"></div>
+    </section>`;
+}
+
 // ── Build directory HTML ───────────────────────────────────────
 function renderDir(dirPath, relPath, ip, port) {
   const baseUrl = `http://${ip}:${port}/`;
@@ -179,8 +376,8 @@ function renderDir(dirPath, relPath, ip, port) {
     <nav class="breadcrumb">
       <a href="/">🏠 根目录</a>
       ${breadcrumb.map((seg, i) => {
-        const link = '/' + breadcrumb.slice(0, i + 1).join('/') + '/';
-        return `<span class="bc-sep">/</span><a href="${link}">${escapeHTML(decodeURIComponent(seg))}</a>`;
+        const link = encodePath('/' + breadcrumb.slice(0, i + 1).join('/')) + '/';
+        return `<span class="bc-sep">/</span><a href="${link}">${escapeHTML(seg)}</a>`;
       }).join('')}
     </nav>` : '';
 
@@ -194,6 +391,8 @@ function renderDir(dirPath, relPath, ip, port) {
       <span class="status-hint">手机可访问</span>
     </div>
 
+    ${renderTraffic()}
+
     <div class="wifi-hint">
       📡 请确保手机和电脑连接同一个 Wi-Fi
     </div>
@@ -205,6 +404,8 @@ function renderDir(dirPath, relPath, ip, port) {
 
     ${bcHTML}
 
+    ${renderUpload(relPath)}
+
     <div class="file-list">
       ${parentRow}
       ${itemsHTML}
@@ -215,8 +416,8 @@ function renderDir(dirPath, relPath, ip, port) {
         <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="var(--ink-secondary)" stroke-width="1.2" style="opacity:0.5">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
         </svg>
-        <p>文件夹为空</p>
-        <span>将文件放入 <code>file/</code> 目录即可在此显示</span>
+        <p>还没有文件</p>
+        <span>拖拽文件到上面的区域，或者点「选择文件」上传</span>
       </div>
     ` : ''}
   `, ip, port, relPath);
@@ -313,6 +514,184 @@ function layout(bodyHTML, ip, port, currentPath) {
     margin-left: auto;
     font-size: 12px;
     color: var(--ink-muted);
+  }
+
+  /* ── Traffic (whole-server throughput) ─────── */
+  .traffic {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px 8px;
+    margin-bottom: 12px;
+  }
+  .traffic-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .traffic-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .traffic-label {
+    font-size: 11px;
+    color: var(--ink-muted);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .traffic-value {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .arrow-up { color: var(--accent); font-size: 9px; }
+  .arrow-down { color: var(--file-blue); font-size: 9px; }
+  .num {
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Mirrored 60s trace: upload above the axis, download below.
+     One shared time axis makes the two directions comparable at a glance. */
+  .duplex {
+    display: block;
+    width: 100%;
+    height: 40px;
+    overflow: visible;
+  }
+  .duplex-axis { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .duplex-line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .duplex-up { stroke: var(--accent); }
+  .duplex-down { stroke: var(--file-blue); }
+  .duplex-caption {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--ink-muted);
+    margin-top: 2px;
+  }
+
+  /* ── Upload ────────────────────────────────── */
+  .upload-panel { margin-bottom: 12px; }
+  .drop-zone {
+    background: var(--surface);
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .drop-zone.is-over {
+    border-color: var(--accent);
+    background: rgba(210, 168, 122, 0.07);
+  }
+  .drop-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .drop-text { flex: 1; min-width: 150px; }
+  .drop-title { display: block; font-size: 13px; font-weight: 600; color: var(--ink); }
+  .drop-sub { display: block; font-size: 11px; color: var(--ink-muted); margin-top: 2px; }
+  .drop-sub code {
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", monospace;
+    color: var(--accent);
+  }
+  .drop-actions { display: flex; gap: 8px; flex-shrink: 0; }
+  .btn {
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--surface-hover);
+    color: var(--ink);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, opacity 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:hover:not(:disabled) { border-color: var(--ink-muted); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #0D1117;
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-bright); border-color: var(--accent-bright); }
+  .btn:focus-visible, .drop-zone:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Per-file progress rows */
+  .upload-list { margin-top: 8px; }
+  .up-row {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    margin-bottom: 6px;
+  }
+  .up-top {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .up-name {
+    flex: 1;
+    min-width: 0;
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .up-status { font-size: 12px; color: var(--ink-secondary); flex-shrink: 0; }
+  .up-row.is-done .up-status { color: var(--safe); }
+  .up-row.is-error .up-status { color: var(--danger); }
+  /* A deliberate cancel isn't a failure — keep it quiet. */
+  .up-row.is-cancelled .up-status { color: var(--ink-muted); }
+  .up-cancel {
+    font-family: inherit;
+    font-size: 11px;
+    background: none;
+    border: none;
+    color: var(--ink-muted);
+    cursor: pointer;
+    padding: 0 2px;
+    flex-shrink: 0;
+  }
+  .up-cancel:hover { color: var(--danger); }
+  .up-cancel:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .up-bar {
+    height: 4px;
+    background: var(--surface-hover);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .up-fill {
+    height: 100%;
+    width: 0;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.2s linear;
+  }
+  .up-row.is-done .up-fill { background: var(--safe); }
+  .up-row.is-error .up-fill { background: var(--danger); }
+  .up-row.is-cancelled .up-fill { background: var(--ink-muted); }
+  .up-meta {
+    display: flex;
+    gap: 10px;
+    margin-top: 5px;
+    font-size: 11px;
+    color: var(--ink-muted);
+  }
+  .up-meta:empty { display: none; }
+
+  @media (max-width: 520px) {
+    .traffic-grid { grid-template-columns: 1fr 1fr; }
+    .drop-actions { width: 100%; }
+    .drop-actions .btn { flex: 1; }
   }
 
   /* ── Wi-Fi hint ────────────────────────────── */
@@ -504,6 +883,8 @@ ${bodyHTML}
   Made with ❤️ by Levi
 </footer>
 <script>
+  const CURRENT_DIR = ${JSON.stringify(currentPath)};
+
   let toastTimer;
   function showToast(msg) {
     const t = document.getElementById('toast');
@@ -512,6 +893,245 @@ ${bodyHTML}
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => t.classList.remove('show'), 2000);
   }
+
+  function formatSpeed(bps) {
+    if (!bps || bps < 1) return '0 B/s';
+    const units = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
+    let i = 0, v = bps;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? Math.round(v) : v.toFixed(1)) + ' ' + units[i];
+  }
+  function formatBytes(b) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = b;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+  }
+  function formatDuration(seconds) {
+    if (!isFinite(seconds) || seconds < 0) return '';
+    if (seconds < 60) return Math.ceil(seconds) + ' 秒';
+    const m = Math.floor(seconds / 60);
+    if (m < 60) return m + ' 分 ' + Math.ceil(seconds % 60) + ' 秒';
+    return Math.floor(m / 60) + ' 小时 ' + (m % 60) + ' 分';
+  }
+
+  /* ── Whole-server speed, refreshed once a second ────────────── */
+  const HISTORY_LEN = 60;
+  const history = [];
+
+  function drawDuplex() {
+    const upLine = document.getElementById('duplex-up');
+    const downLine = document.getElementById('duplex-down');
+    if (!upLine || !downLine) return;
+
+    // Auto-range to the busiest second on screen, floored at 1 MB/s so an
+    // idle link draws a flat line instead of amplifying rounding noise.
+    let peak = 0;
+    for (const h of history) peak = Math.max(peak, h.up, h.down);
+    const scale = Math.max(peak, 1024 * 1024);
+    const x = i => (i / (HISTORY_LEN - 1)) * 300;
+    const offset = HISTORY_LEN - history.length;
+    // pick() returns the signed pixel offset from the centre line
+    const trace = pick => history
+      .map((h, i) => x(i + offset).toFixed(1) + ',' + (20 + pick(h)).toFixed(1))
+      .join(' ');
+
+    upLine.setAttribute('points', trace(h => -Math.min(1, h.up / scale) * 18));
+    downLine.setAttribute('points', trace(h => Math.min(1, h.down / scale) * 18));
+  }
+
+  async function pollStats() {
+    if (document.hidden) return; // a hidden tab shouldn't keep the server busy
+    try {
+      const res = await fetch('/api/stats', { cache: 'no-store' });
+      if (!res.ok) return;
+      const s = await res.json();
+      document.getElementById('stat-upload').textContent = formatSpeed(s.uploadSpeed);
+      document.getElementById('stat-download').textContent = formatSpeed(s.downloadSpeed);
+      document.getElementById('stat-active-upload').textContent = s.activeUploads;
+      document.getElementById('stat-active-download').textContent = s.activeDownloads;
+
+      history.push({ up: s.uploadSpeed, down: s.downloadSpeed });
+      if (history.length > HISTORY_LEN) history.shift();
+      drawDuplex();
+    } catch (_) { /* server restarting — try again next tick */ }
+  }
+  setInterval(pollStats, 1000);
+  pollStats();
+
+  /* ── Upload ─────────────────────────────────────────────────
+     One file per request, one request at a time. Sequential keeps
+     per-file speed honest and avoids hammering the server's disk. */
+  const fileInput = document.getElementById('file-input');
+  const pickBtn = document.getElementById('pick-btn');
+  const uploadBtn = document.getElementById('upload-btn');
+  const dropZone = document.getElementById('drop-zone');
+  const list = document.getElementById('upload-list');
+
+  const queue = [];
+  let activeCount = 0;
+  let succeeded = 0;
+  let refreshing = false;
+
+  function setStatus(item, state, text) {
+    item.row.className = 'up-row is-' + state;
+    item.row.querySelector('.up-status').textContent = text;
+  }
+  function setProgress(item, fraction) {
+    item.row.querySelector('.up-fill').style.width = (fraction * 100).toFixed(1) + '%';
+  }
+  function setMeta(item, parts) {
+    item.row.querySelector('.up-meta').textContent = parts.filter(Boolean).join(' · ');
+  }
+
+  function addFiles(files) {
+    for (const file of files) {
+      const row = document.createElement('div');
+      row.className = 'up-row is-waiting';
+      row.innerHTML =
+        '<div class="up-top">' +
+          '<span class="up-name"></span>' +
+          '<span class="up-status">等待中</span>' +
+          '<button type="button" class="up-cancel" aria-label="取消上传">✕</button>' +
+        '</div>' +
+        '<div class="up-bar"><div class="up-fill"></div></div>' +
+        '<div class="up-meta"></div>';
+      row.querySelector('.up-name').textContent = file.name;
+      list.appendChild(row);
+
+      const item = { file, row, xhr: null, started: false, cancelled: false, lastLoaded: 0, lastTime: 0 };
+      const cancelBtn = row.querySelector('.up-cancel');
+      cancelBtn.addEventListener('click', () => {
+        if (item.xhr) { item.xhr.abort(); return; }
+        item.cancelled = true;
+        setStatus(item, 'cancelled', '已取消');
+        pump();
+      });
+      queue.push(item);
+    }
+    uploadBtn.disabled = queue.every(i => i.started || i.cancelled);
+  }
+
+  function send(item) {
+    const xhr = new XMLHttpRequest();
+    item.xhr = xhr;
+    item.lastTime = Date.now();
+    setStatus(item, 'active', '上传中');
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const fraction = e.loaded / e.total;
+      setProgress(item, fraction);
+
+      // Percentage is exact immediately; speed needs a window to be meaningful.
+      const now = Date.now();
+      const dt = (now - item.lastTime) / 1000;
+      if (dt >= 0.4) {
+        item.speed = (e.loaded - item.lastLoaded) / dt;
+        item.lastLoaded = e.loaded;
+        item.lastTime = now;
+      }
+      const eta = item.speed > 0 ? (e.total - e.loaded) / item.speed : Infinity;
+      setMeta(item, [
+        Math.floor(fraction * 100) + '%',
+        item.speed ? formatSpeed(item.speed) : '',
+        eta === Infinity ? '' : '还剩 ' + formatDuration(eta),
+      ]);
+    };
+
+    xhr.onload = () => {
+      activeCount--;
+      let data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (_) {}
+
+      const entry = data && data.files && data.files[0];
+      if (entry && entry.ok) {
+        succeeded++;
+        setProgress(item, 1);
+        setStatus(item, 'done', '✓ 上传完成');
+        // Same name already existed? The server kept both — say so.
+        setMeta(item, [
+          formatBytes(entry.size),
+          entry.savedAs !== entry.name ? '已保存为 ' + entry.savedAs : '',
+        ]);
+        const cancelBtn = item.row.querySelector('.up-cancel');
+        if (cancelBtn) cancelBtn.remove();
+      } else {
+        setProgress(item, 1);
+        setStatus(item, 'error', '✕ 上传失败');
+        setMeta(item, [(entry && entry.error) || (data && data.error) || ('HTTP ' + xhr.status)]);
+      }
+      pump();
+    };
+    xhr.onerror = () => {
+      activeCount--;
+      setStatus(item, 'error', '✕ 上传失败');
+      setMeta(item, ['网络错误，连接已中断']);
+      pump();
+    };
+    xhr.onabort = () => {
+      activeCount--;
+      setStatus(item, 'cancelled', '已取消');
+      setMeta(item, [formatBytes(item.lastLoaded) + ' 已传输']);
+      pump();
+    };
+
+    const dir = CURRENT_DIR ? '?dir=' + encodeURIComponent(CURRENT_DIR) : '';
+    xhr.open('POST', '/api/upload' + dir);
+    const form = new FormData();
+    form.append('file', item.file, item.file.name);
+    xhr.send(form);
+  }
+
+  function pump() {
+    if (activeCount > 0 || refreshing) return;
+
+    const next = queue.find(i => !i.started && !i.cancelled);
+    if (next) {
+      next.started = true;
+      activeCount++;
+      send(next);
+      return;
+    }
+
+    // Everything settled — reload so the new files show up in the list.
+    if (succeeded > 0) {
+      refreshing = true;
+      showToast('✓ 已上传 ' + succeeded + ' 个文件 · 正在刷新列表');
+      setTimeout(() => location.reload(), 1400);
+    } else {
+      uploadBtn.disabled = true;
+    }
+  }
+
+  pickBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files.length) addFiles(fileInput.files);
+    fileInput.value = ''; // so picking the same file again still fires
+  });
+  uploadBtn.addEventListener('click', () => {
+    uploadBtn.disabled = true;
+    pump();
+  });
+
+  // Dropping anywhere on the page counts — the zone lights up as the target.
+  window.addEventListener('dragenter', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dropZone.classList.add('is-over');
+  });
+  window.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (e.relatedTarget === null) dropZone.classList.remove('is-over');
+  });
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dropZone.classList.remove('is-over');
+    if (e.dataTransfer && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
 </script>
 </body>
 </html>`;
@@ -521,15 +1141,262 @@ function escapeHTML(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// ── Stream a file to the client, metering what really goes out ─
+function serveFile(req, res, absPath, stat, range) {
+  const ext = path.extname(absPath).toLowerCase();
+  const mime = MIME[ext] || 'application/octet-stream';
+  const totalSize = stat.size;
+
+  let start = 0;
+  let end = totalSize - 1;
+  let status = 200;
+  const headers = {
+    'Content-Type': mime,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'no-cache',
+  };
+
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+    if (match) {
+      const [, rawStart, rawEnd] = match;
+      if (rawStart === '' && rawEnd === '') {
+        res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
+        res.end();
+        return;
+      }
+      // "bytes=-500" means the last 500 bytes
+      if (rawStart === '') {
+        start = Math.max(0, totalSize - Number(rawEnd));
+      } else {
+        start = Number(rawStart);
+        end = rawEnd === '' ? totalSize - 1 : Math.min(Number(rawEnd), totalSize - 1);
+      }
+      if (Number.isNaN(start) || Number.isNaN(end) || start > end || start >= totalSize) {
+        res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
+        res.end();
+        return;
+      }
+      status = 206;
+      headers['Content-Range'] = `bytes ${start}-${end}/${totalSize}`;
+    }
+  }
+
+  headers['Content-Length'] = end - start + 1;
+
+  // A HEAD response has no body — don't count it as traffic.
+  if (req.method === 'HEAD') {
+    res.writeHead(status, headers);
+    res.end();
+    return;
+  }
+
+  res.writeHead(status, headers);
+
+  traffic.activeDownloads++;
+  const source = fs.createReadStream(absPath, { start, end });
+  const meter = meterStream('downloadBytes');
+
+  // pipeline() destroys the reader if the client goes away mid-download,
+  // so an aborted transfer can't keep draining the disk into a dead socket.
+  pipeline(source, meter, res, () => {
+    traffic.activeDownloads--;
+  });
+}
+
+// ── POST /api/upload ───────────────────────────────────────────
+// Files stream straight to disk: nothing is ever buffered whole in RAM.
+// Target directory comes from ?dir=<relative path inside the share>.
+function handleUpload(req, res, query) {
+  const targetDir = safeResolve(query.get('dir') || '');
+  if (!targetDir) {
+    sendJSON(res, 403, { ok: false, error: '目标目录不在共享范围内' });
+    req.resume();
+    return;
+  }
+
+  let dirStat;
+  try {
+    dirStat = fs.statSync(targetDir);
+  } catch {
+    sendJSON(res, 404, { ok: false, error: '目标目录不存在' });
+    req.resume();
+    return;
+  }
+  if (!dirStat.isDirectory()) {
+    sendJSON(res, 400, { ok: false, error: '目标不是目录' });
+    req.resume();
+    return;
+  }
+
+  let busboy;
+  try {
+    busboy = Busboy({
+      headers: req.headers,
+      limits: MAX_UPLOAD_BYTES ? { fileSize: MAX_UPLOAD_BYTES } : {},
+    });
+  } catch {
+    sendJSON(res, 400, { ok: false, error: '无效的 multipart/form-data 请求' });
+    req.resume();
+    return;
+  }
+
+  const files = [];
+  const inFlight = new Set(); // live { source, dest } pairs, so an abort can tear them down
+  let pending = 0;            // file streams still in flight
+  let parserClosed = false;
+  let responded = false;
+
+  const respond = () => {
+    if (responded || !parserClosed || pending > 0) return;
+    if (res.writableEnded || res.destroyed || !res.writable) return; // client already gone
+    responded = true;
+    if (files.length === 0) {
+      sendJSON(res, 400, { ok: false, error: '没有收到文件', files: [] });
+      return;
+    }
+    const okCount = files.filter(f => f.ok).length;
+    sendJSON(res, okCount > 0 ? 200 : 400, {
+      ok: okCount === files.length,
+      dir: query.get('dir') || '',
+      files,
+    });
+  };
+
+  busboy.on('file', (_field, file, info) => {
+    const name = safeName(info.filename);
+    const entry = { ok: false, name, savedAs: null, size: 0, error: null };
+    files.push(entry);
+
+    // Open the destination first; if we can't, drain this part and move on.
+    let target;
+    try {
+      target = createUniqueFile(targetDir, name);
+    } catch (err) {
+      entry.error = '无法创建文件: ' + err.message;
+      file.resume(); // drain the part, otherwise the parser stalls
+      return;
+    }
+    entry.savedAs = target.finalName;
+
+    pending++;
+    traffic.activeUploads++;
+
+    const dest = path.join(targetDir, target.finalName);
+    const meter = meterStream('uploadBytes', n => { entry.size += n; });
+
+    file.on('limit', () => {
+      entry.error = `超过单文件上限 ${humanSize(MAX_UPLOAD_BYTES)}`;
+    });
+
+    const pair = { source: file, dest: target.stream };
+    inFlight.add(pair);
+
+    pipeline(file, meter, target.stream, (err) => {
+      inFlight.delete(pair);
+      traffic.activeUploads--;
+      pending--;
+
+      if (err) {
+        entry.ok = false;
+        entry.error = entry.error || (req.destroyed || err.code === 'ERR_STREAM_PREMATURE_CLOSE'
+          ? '客户端中断'
+          : '写入失败: ' + (err.message || err.code));
+      } else if (entry.error) {
+        entry.ok = false; // tripped the size limit — file on disk is incomplete
+      } else {
+        entry.ok = true;
+      }
+
+      if (entry.ok) {
+        respond();
+      } else {
+        // Never leave a half-written file behind.
+        fs.unlink(dest, () => respond());
+      }
+    });
+  });
+
+  busboy.on('error', () => {
+    parserClosed = true;
+    respond();
+  });
+
+  busboy.on('close', () => {
+    parserClosed = true;
+    respond();
+  });
+
+  // Writing to a socket the client already dropped must never crash the server.
+  res.on('error', () => {});
+  req.on('error', () => {});
+
+  // Client vanished mid-body: busboy will never emit 'close', so tear the
+  // in-flight pipes down by hand. pipeline() then reports each one as failed
+  // and the half-written file is deleted.
+  req.on('close', () => {
+    if (req.complete) return; // normal end of request
+    parserClosed = true;
+    for (const { source, dest } of inFlight) {
+      source.destroy();
+      dest.destroy();
+    }
+  });
+
+  req.pipe(busboy);
+}
+
 // ── Request handler ────────────────────────────────────────────
 function handleRequest(req, res) {
+  if (req.url.includes('\0')) {
+    res.writeHead(400);
+    res.end('Bad Request');
+    return;
+  }
+
   // Decode URL path
   let urlPath;
+  let query;
   try {
-    urlPath = decodeURIComponent(req.url.split('?')[0]);
+    const [rawPath, rawQuery] = req.url.split('?');
+    urlPath = decodeURIComponent(rawPath);
+    query = new URLSearchParams(rawQuery || '');
   } catch {
     res.writeHead(400);
     res.end('Bad Request');
+    return;
+  }
+
+  // ── API: live speeds for the whole server ──
+  if (urlPath === '/api/stats') {
+    if (req.method !== 'GET') {
+      res.writeHead(405, { Allow: 'GET' });
+      res.end();
+      return;
+    }
+    sendJSON(res, 200, {
+      uploadSpeed: speed.upload,
+      downloadSpeed: speed.download,
+      activeUploads: traffic.activeUploads,
+      activeDownloads: traffic.activeDownloads,
+    });
+    return;
+  }
+
+  // ── API: upload ──
+  if (urlPath === '/api/upload') {
+    if (req.method !== 'POST') {
+      res.writeHead(405, { Allow: 'POST' });
+      res.end();
+      return;
+    }
+    handleUpload(req, res, query);
+    return;
+  }
+
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { Allow: 'GET, HEAD' });
+    res.end();
     return;
   }
 
@@ -537,11 +1404,10 @@ function handleRequest(req, res) {
   const isDirReq = urlPath.endsWith('/');
   const normalized = urlPath.replace(/\/+$/, '');
   const relPath = normalized.replace(/^\//, '');
-  const diskPath = path.join(SERVE_ROOT, relPath);
 
-  // Security: prevent traversal outside SERVE_ROOT
-  const resolved = path.resolve(diskPath);
-  if (!resolved.startsWith(SERVE_ROOT)) {
+  // Security: nothing may resolve outside the share root
+  const resolved = safeResolve(relPath);
+  if (!resolved) {
     res.writeHead(403);
     res.end(renderError(403, '禁止访问'));
     return;
@@ -560,8 +1426,8 @@ function handleRequest(req, res) {
   // If it's a directory, serve the HTML listing
   if (stat.isDirectory()) {
     // Redirect "/dir" to "/dir/" so relative links work
-    if (!isDirReq && req.url !== '/') {
-      res.writeHead(301, { Location: req.url + '/' });
+    if (!isDirReq && urlPath !== '/') {
+      res.writeHead(301, { Location: req.url.split('?')[0] + '/' });
       res.end();
       return;
     }
@@ -571,40 +1437,13 @@ function handleRequest(req, res) {
     return;
   }
 
-  // It's a file — serve it
-  const ext = path.extname(resolved).toLowerCase();
-  const mime = MIME[ext] || 'application/octet-stream';
-  const totalSize = stat.size;
-
-  // Range request support (for video seeking)
-  const range = req.headers.range;
-  if (range) {
-    const parts = range.replace(/bytes=/, '').split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
-    const chunkSize = end - start + 1;
-
-    res.writeHead(206, {
-      'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-      'Accept-Ranges': 'bytes',
-      'Content-Length': chunkSize,
-      'Content-Type': mime,
-    });
-    const stream = fs.createReadStream(resolved, { start, end });
-    stream.pipe(res);
-    stream.on('error', () => { res.end(); });
+  if (!stat.isFile()) {
+    res.writeHead(403);
+    res.end(renderError(403, '不支持的文件类型'));
     return;
   }
 
-  res.writeHead(200, {
-    'Content-Type': mime,
-    'Content-Length': totalSize,
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'no-cache',
-  });
-  const stream = fs.createReadStream(resolved);
-  stream.pipe(res);
-  stream.on('error', () => { res.end(); });
+  serveFile(req, res, resolved, stat, req.headers.range);
 }
 
 // ── Start server ───────────────────────────────────────────────

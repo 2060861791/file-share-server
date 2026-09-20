@@ -1,6 +1,15 @@
 {
+  "name": "file-share-server",
+  "version": "2.0.0",
+  "description": "局域网文件共享服务器 — 网页上传/下载、实时速度统计、零前端框架",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "boxen": "^5.1.2",
+    "busboy": "^1.6.0",
     "chalk": "^4.1.2",
     "log-symbols": "^4.1.0",
     "ora": "^5.4.1",
