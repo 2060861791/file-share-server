@@ -78,6 +78,24 @@ const traffic = {
 const speed = { upload: 0, download: 0 };
 let lastSample = { bytes: 0, bytesDown: 0, at: Date.now() };
 
+// ── Per-directory upload revisions ─────────────────────────────
+// Bumped once per file that lands, so browsers viewing that directory know
+// to refresh. Entries are only ever created by a *successful upload*, never
+// by a lookup — otherwise anyone could grow this map by spamming
+// /api/stats?dir=<random>. That also caps it at the number of real folders.
+const dirRevisions = new Map();
+
+function revisionKey(absDir) {
+  return process.platform === 'win32' ? absDir.toLowerCase() : absDir;
+}
+function currentRevision(absDir) {
+  return dirRevisions.get(revisionKey(absDir)) || 0;
+}
+function bumpRevision(absDir) {
+  const key = revisionKey(absDir);
+  dirRevisions.set(key, (dirRevisions.get(key) || 0) + 1);
+}
+
 setInterval(() => {
   const now = Date.now();
   const seconds = (now - lastSample.at) / 1000;
@@ -107,11 +125,23 @@ function safeResolve(relative) {
   return target;
 }
 
+// Multipart filenames are the wild west: the header's default charset is
+// latin1, so the raw UTF-8 bytes browsers send arrive as one char per byte
+// ("TypeScript 快速上手.pdf" -> "TypeScript å¿«éä¸æ.pdf"). Re-read those
+// bytes as UTF-8 — but only when that actually yields valid text, so clients
+// that used filename*=UTF-8'' (already decoded) or genuine latin1 survive.
+function decodeMultipartName(raw) {
+  const name = String(raw == null ? '' : raw);
+  if (!/[\x80-\xff]/.test(name)) return name; // pure ASCII, nothing to do
+  const reinterpreted = Buffer.from(name, 'latin1').toString('utf8');
+  return reinterpreted.includes('\uFFFD') ? name : reinterpreted;
+}
+
 // Turn any user-supplied label into a single safe path segment.
 function safeName(raw) {
   let name = String(raw == null ? '' : raw);
   name = name.split(/[\\/]/).pop() || '';        // drop any directory part (both separators, any OS)
-  name = name.replace(/[\x00-\x1f\x7f]/g, '');   // control chars & NUL
+  name = name.replace(/[\x00-\x1f\x7f-\x9f]/g, ''); // control chars, NUL, C1 block
   name = name.trim();
   if (name === '.' || name === '..') name = '';  // never a directory reference
   if (!name) name = 'unnamed';
@@ -264,50 +294,47 @@ function encodePath(p) {
 
 // ── Live throughput panel ──────────────────────────────────────
 // Values are the whole server's — every client's transfers added together,
-// not just the browser looking at this page.
+// not just the browser looking at this page. Each direction gets its own
+// labelled chart; both share one scale so the two lines are comparable.
 function renderTraffic() {
+  const chart = (dir, label, arrowClass) => `
+      <div class="chart">
+        <div class="chart-head">
+          <span class="chart-name"><span class="${arrowClass}">${dir === 'up' ? '▲' : '▼'}</span> ${label}</span>
+          <span class="chart-value num" id="stat-${dir === 'up' ? 'upload' : 'download'}">0 B/s</span>
+        </div>
+        <svg class="chart-svg" viewBox="0 0 300 28" preserveAspectRatio="none" aria-hidden="true">
+          <polyline class="chart-line chart-${dir}" id="chart-${dir}" points="" />
+        </svg>
+        <div class="chart-foot">
+          <span>近 60 秒 · 所有用户合计</span>
+          <span class="chart-scale">刻度 <span class="num" id="scale-${dir}">1.0 MB/s</span></span>
+        </div>
+      </div>`;
+
   return `
     <section class="traffic" aria-label="服务器实时速度">
-      <div class="traffic-grid">
-        <div class="traffic-cell">
-          <span class="traffic-label"><span class="arrow-up">▲</span> 上传速度</span>
-          <span class="traffic-value num" id="stat-upload">0 B/s</span>
-        </div>
-        <div class="traffic-cell">
-          <span class="traffic-label"><span class="arrow-down">▼</span> 下载速度</span>
-          <span class="traffic-value num" id="stat-download">0 B/s</span>
-        </div>
-        <div class="traffic-cell">
-          <span class="traffic-label">活动上传</span>
-          <span class="traffic-value num" id="stat-active-upload">0</span>
-        </div>
-        <div class="traffic-cell">
-          <span class="traffic-label">活动下载</span>
-          <span class="traffic-value num" id="stat-active-download">0</span>
-        </div>
-      </div>
-      <svg class="duplex" id="duplex" viewBox="0 0 300 40" preserveAspectRatio="none" aria-hidden="true">
-        <line class="duplex-axis" x1="0" y1="20" x2="300" y2="20" />
-        <polyline class="duplex-line duplex-up" id="duplex-up" points="" />
-        <polyline class="duplex-line duplex-down" id="duplex-down" points="" />
-      </svg>
-      <div class="duplex-caption">
-        <span>近 60 秒 · 所有用户合计</span>
-        <span><span class="arrow-up">▲</span> 上传&nbsp;&nbsp;<span class="arrow-down">▼</span> 下载</span>
+      ${chart('up', '上传速度', 'arrow-up')}
+      ${chart('down', '下载速度', 'arrow-down')}
+      <div class="traffic-foot">
+        <span>活动传输</span>
+        <span><span class="arrow-up">▲</span> <span class="num" id="stat-active-upload">0</span>
+              <span class="arrow-down">▼</span> <span class="num" id="stat-active-download">0</span></span>
       </div>
     </section>`;
 }
 
 // ── Upload panel (uploads land in the directory being viewed) ──
 function renderUpload(relPath) {
-  const here = '/' + (relPath ? relPath + '/' : '');
+  // The absolute path on disk — the one thing the breadcrumb can't tell you.
+  const diskPath = path.join(ROOT, relPath || '') + path.sep;
   return `
     <section class="upload-panel">
       <div class="drop-zone" id="drop-zone">
         <div class="drop-row">
           <div class="drop-text">
             <span class="drop-title">拖拽文件到这里上传</span>
-            <span class="drop-sub">保存到 <code>${escapeHTML(here)}</code></span>
+            <span class="drop-sub">保存到 <code>${escapeHTML(diskPath)}</code></span>
           </div>
           <div class="drop-actions">
             <button type="button" class="btn" id="pick-btn">选择文件</button>
@@ -420,7 +447,7 @@ function renderDir(dirPath, relPath, ip, port) {
         <span>拖拽文件到上面的区域，或者点「选择文件」上传</span>
       </div>
     ` : ''}
-  `, ip, port, relPath);
+  `, ip, port, relPath, currentRevision(dirPath));
 }
 
 function renderError(code, msg) {
@@ -436,7 +463,7 @@ function renderError(code, msg) {
 }
 
 // ── Page layout shell ──────────────────────────────────────────
-function layout(bodyHTML, ip, port, currentPath) {
+function layout(bodyHTML, ip, port, currentPath, pageRevision) {
   const baseUrl = `http://${ip}:${port}/`;
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -521,29 +548,8 @@ function layout(bodyHTML, ip, port, currentPath) {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 12px 14px 8px;
+    padding: 12px 14px;
     margin-bottom: 12px;
-  }
-  .traffic-grid {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 8px;
-    margin-bottom: 10px;
-  }
-  .traffic-cell { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-  .traffic-label {
-    font-size: 11px;
-    color: var(--ink-muted);
-    letter-spacing: 0.02em;
-    white-space: nowrap;
-  }
-  .traffic-value {
-    font-size: 15px;
-    font-weight: 600;
-    color: var(--ink);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .arrow-up { color: var(--accent); font-size: 9px; }
   .arrow-down { color: var(--file-blue); font-size: 9px; }
@@ -552,24 +558,59 @@ function layout(bodyHTML, ip, port, currentPath) {
     font-variant-numeric: tabular-nums;
   }
 
-  /* Mirrored 60s trace: upload above the axis, download below.
-     One shared time axis makes the two directions comparable at a glance. */
-  .duplex {
+  /* One labelled chart per direction. Both share a single scale, so a longer
+     line really does mean more traffic — not just a busier-looking shape. */
+  .chart + .chart {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+  .chart-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .chart-name {
+    font-size: 12px;
+    color: var(--ink-secondary);
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .chart-value {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .chart-svg {
     display: block;
     width: 100%;
-    height: 40px;
-    overflow: visible;
+    height: 28px;
+    background: linear-gradient(to top, rgba(255,255,255,0.025), transparent);
+    border-radius: 4px;
   }
-  .duplex-axis { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
-  .duplex-line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-  .duplex-up { stroke: var(--accent); }
-  .duplex-down { stroke: var(--file-blue); }
-  .duplex-caption {
+  .chart-line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+  .chart-up { stroke: var(--accent); }
+  .chart-down { stroke: var(--file-blue); }
+  .chart-foot {
     display: flex;
     justify-content: space-between;
+    gap: 8px;
     font-size: 10px;
     color: var(--ink-muted);
-    margin-top: 2px;
+    margin-top: 4px;
+  }
+  .chart-scale { white-space: nowrap; }
+  .traffic-foot {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--ink-muted);
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
   }
 
   /* ── Upload ────────────────────────────────── */
@@ -689,7 +730,7 @@ function layout(bodyHTML, ip, port, currentPath) {
   .up-meta:empty { display: none; }
 
   @media (max-width: 520px) {
-    .traffic-grid { grid-template-columns: 1fr 1fr; }
+    .chart-value { font-size: 15px; }
     .drop-actions { width: 100%; }
     .drop-actions .btn { flex: 1; }
   }
@@ -884,6 +925,7 @@ ${bodyHTML}
 </footer>
 <script>
   const CURRENT_DIR = ${JSON.stringify(currentPath)};
+  const PAGE_REVISION = ${Number(pageRevision) || 0};
 
   let toastTimer;
   function showToast(msg) {
@@ -917,33 +959,44 @@ ${bodyHTML}
 
   /* ── Whole-server speed, refreshed once a second ────────────── */
   const HISTORY_LEN = 60;
+  const CHART_H = 26; // px of drawable height inside the 28px viewBox
   const history = [];
 
-  function drawDuplex() {
-    const upLine = document.getElementById('duplex-up');
-    const downLine = document.getElementById('duplex-down');
-    if (!upLine || !downLine) return;
+  function drawCharts() {
+    const lines = {
+      up: document.getElementById('chart-up'),
+      down: document.getElementById('chart-down'),
+    };
+    if (!lines.up || !lines.down) return;
 
-    // Auto-range to the busiest second on screen, floored at 1 MB/s so an
-    // idle link draws a flat line instead of amplifying rounding noise.
+    // Both directions share one scale (the busier of the two, floored at
+    // 1 MB/s). Separate scales would make a quiet upload look as busy as a
+    // saturated download.
     let peak = 0;
     for (const h of history) peak = Math.max(peak, h.up, h.down);
     const scale = Math.max(peak, 1024 * 1024);
+
     const x = i => (i / (HISTORY_LEN - 1)) * 300;
     const offset = HISTORY_LEN - history.length;
-    // pick() returns the signed pixel offset from the centre line
-    const trace = pick => history
-      .map((h, i) => x(i + offset).toFixed(1) + ',' + (20 + pick(h)).toFixed(1))
+    const trace = key => history
+      .map((h, i) => x(i + offset).toFixed(1) + ',' +
+        (28 - Math.min(1, h[key] / scale) * CHART_H).toFixed(1))
       .join(' ');
 
-    upLine.setAttribute('points', trace(h => -Math.min(1, h.up / scale) * 18));
-    downLine.setAttribute('points', trace(h => Math.min(1, h.down / scale) * 18));
+    lines.up.setAttribute('points', trace('up'));
+    lines.down.setAttribute('points', trace('down'));
+
+    const label = formatSpeed(scale);
+    document.getElementById('scale-up').textContent = label;
+    document.getElementById('scale-down').textContent = label;
   }
 
   async function pollStats() {
     if (document.hidden) return; // a hidden tab shouldn't keep the server busy
     try {
-      const res = await fetch('/api/stats', { cache: 'no-store' });
+      // Always send dir, even when empty — the root listing needs revisions too.
+      const url = '/api/stats?dir=' + encodeURIComponent(CURRENT_DIR);
+      const res = await fetch(url, { cache: 'no-store' });
       if (!res.ok) return;
       const s = await res.json();
       document.getElementById('stat-upload').textContent = formatSpeed(s.uploadSpeed);
@@ -953,11 +1006,26 @@ ${bodyHTML}
 
       history.push({ up: s.uploadSpeed, down: s.downloadSpeed });
       if (history.length > HISTORY_LEN) history.shift();
-      drawDuplex();
+      drawCharts();
+
+      maybeReload(s.dirRevision);
     } catch (_) { /* server restarting — try again next tick */ }
   }
   setInterval(pollStats, 1000);
   pollStats();
+
+  // Coming back to a hidden tab should show fresh content immediately.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) pollStats();
+  });
+
+  try {
+    if (sessionStorage.getItem('restoreScroll') === '1') {
+      sessionStorage.removeItem('restoreScroll');
+      const y = Number(sessionStorage.getItem('scrollY')) || 0;
+      window.scrollTo(0, y);
+    }
+  } catch (_) {}
 
   /* ── Upload ─────────────────────────────────────────────────
      One file per request, one request at a time. Sequential keeps
@@ -971,7 +1039,7 @@ ${bodyHTML}
   const queue = [];
   let activeCount = 0;
   let succeeded = 0;
-  let refreshing = false;
+  let notified = false;
 
   function setStatus(item, state, text) {
     item.row.className = 'up-row is-' + state;
@@ -1084,7 +1152,7 @@ ${bodyHTML}
   }
 
   function pump() {
-    if (activeCount > 0 || refreshing) return;
+    if (activeCount > 0) return;
 
     const next = queue.find(i => !i.started && !i.cancelled);
     if (next) {
@@ -1094,11 +1162,14 @@ ${bodyHTML}
       return;
     }
 
-    // Everything settled — reload so the new files show up in the list.
+    // Everything settled. No reload here on purpose — the file landing bumped
+    // this directory's revision, so the next poll refreshes every viewer of
+    // it, this one included, through a single path.
     if (succeeded > 0) {
-      refreshing = true;
-      showToast('✓ 已上传 ' + succeeded + ' 个文件 · 正在刷新列表');
-      setTimeout(() => location.reload(), 1400);
+      if (!notified) {
+        notified = true;
+        showToast('✓ 已上传 ' + succeeded + ' 个文件 · 列表即将刷新');
+      }
     } else {
       uploadBtn.disabled = true;
     }
@@ -1132,6 +1203,28 @@ ${bodyHTML}
     dropZone.classList.remove('is-over');
     if (e.dataTransfer && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
   });
+
+  /* ── Auto-refresh when this folder gains a file ───────────────
+     The server bumps a per-directory revision on every successful
+     upload. When the folder we're looking at moves past the revision
+     this page was rendered with, someone uploaded — reload so nobody
+     has to know to hit refresh. Costs no extra request: it rides along
+     with the speed poll that is already running. */
+  let lastReload = 0;
+
+  function maybeReload(dirRevision) {
+    if (typeof dirRevision !== 'number' || dirRevision <= PAGE_REVISION) return;
+    if (activeCount > 0) return;                                        // our own upload in flight
+    if (queue.some(i => !i.started && !i.cancelled)) return;            // files still queued
+    if (dropZone.classList.contains('is-over')) return;                 // a drop is in progress
+    if (Date.now() - lastReload < 5000) return;                         // no reload storms
+    lastReload = Date.now();
+    try {
+      sessionStorage.setItem('restoreScroll', '1');
+      sessionStorage.setItem('scrollY', String(window.scrollY));
+    } catch (_) {}
+    location.reload();
+  }
 </script>
 </body>
 </html>`;
@@ -1264,7 +1357,7 @@ function handleUpload(req, res, query) {
   };
 
   busboy.on('file', (_field, file, info) => {
-    const name = safeName(info.filename);
+    const name = safeName(decodeMultipartName(info.filename));
     const entry = { ok: false, name, savedAs: null, size: 0, error: null };
     files.push(entry);
 
@@ -1309,6 +1402,7 @@ function handleUpload(req, res, query) {
       }
 
       if (entry.ok) {
+        bumpRevision(targetDir); // tells everyone viewing this folder to refresh
         respond();
       } else {
         // Never leave a half-written file behind.
@@ -1374,12 +1468,18 @@ function handleRequest(req, res) {
       res.end();
       return;
     }
-    sendJSON(res, 200, {
+    const payload = {
       uploadSpeed: speed.upload,
       downloadSpeed: speed.download,
       activeUploads: traffic.activeUploads,
       activeDownloads: traffic.activeDownloads,
-    });
+    };
+    // Only answered when asked for, and only ever read — never a map write.
+    if (query.has('dir')) {
+      const absDir = safeResolve(query.get('dir'));
+      payload.dirRevision = absDir ? currentRevision(absDir) : 0;
+    }
+    sendJSON(res, 200, payload);
     return;
   }
 
